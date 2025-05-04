@@ -2,22 +2,21 @@
 
 import type { Symptom, MedicalHistory, PatientProfile } from '@/services/medical-diagnosis';
 import type { AnalyzeSymptomsInput, AnalyzeSymptomsOutput } from '@/ai/flows/analyze-symptoms';
-import { useState, useCallback } from 'react';
-import { useForm, useFieldArray } from 'react-hook-form';
+import { useState, useCallback, useEffect } from 'react';
+import { useForm, useFieldArray, FormProvider } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { analyzeSymptoms } from '@/ai/flows/analyze-symptoms';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Textarea } from '@/components/ui/textarea';
-import { Label } from '@/components/ui/label';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
-import { PlusCircle, Trash2, Loader2, ImageUp, X } from 'lucide-react';
+import { Loader2 } from 'lucide-react';
 import { DiagnosisResults } from '@/components/diagnosis-results';
 import { useToast } from "@/hooks/use-toast";
-import Image from 'next/image'; // Import next/image
+import { ProfileInfoStep } from '../components/symptom-checker/profile-info-step';
+import { SymptomsStep } from '../components/symptom-checker/symptoms-step';
+import { MedicalImageStep } from '../components/symptom-checker/medical-image-step';
+import { MedicalHistoryStep } from '../components/symptom-checker/medical-history-step';
+import { Progress } from '@/components/ui/progress';
 
 // Define Zod schema based on AnalyzeSymptomsInputSchema for client-side validation
 const symptomSchema = z.object({
@@ -26,14 +25,14 @@ const symptomSchema = z.object({
 });
 
 const medicalHistorySchema = z.object({
-  pastConditions: z.string().optional(), // Using string for textarea input, will split later
-  currentMedications: z.string().optional(), // Using string for textarea input, will split later
+  pastConditions: z.string().optional(),
+  currentMedications: z.string().optional(),
 });
 
-// Define max file size (e.g., 10MB)
+// Define max file size (10MB)
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 // Define accepted image types
-const ACCEPTED_IMAGE_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/dicom"]; // Added dicom based on context, browser support varies
+const ACCEPTED_IMAGE_TYPES = ["image/jpeg", "image/jpg", "image/png", "image/webp", "image/dicom"];
 
 const formSchema = z.object({
   name: z.string().min(1, 'Name is required.'),
@@ -53,30 +52,38 @@ const formSchema = z.object({
       "Only .jpg, .jpeg, .png, .webp and .dicom formats are supported."
     )
     .optional(),
+  imageDescription: z.string().max(1000, 'Description must be less than 1000 characters').optional(),
 }).refine(data => (data.weight ? !!data.weightUnit : true), {
     message: "Weight unit is required if weight is provided.",
     path: ["weightUnit"],
 }).refine(data => (data.height ? !!data.heightUnit : true), {
     message: "Height unit is required if height is provided.",
     path: ["heightUnit"],
+}).refine(data => (data.medicalImage && data.medicalImage.length > 0 ? !!data.imageDescription : true), {
+    message: "Please provide a description for the uploaded image.",
+    path: ["imageDescription"],
 });
 
-
-type FormData = z.infer<typeof formSchema>;
-
-const severityLevels = ["Mild", "Moderate", "Severe", "Very Severe"];
-const genderOptions = ["Male", "Female", "Other", "Prefer not to say"];
-const weightUnits = ["kg", "lbs"];
-const heightUnits = ["cm", "in", "ft"];
+export type FormData = z.infer<typeof formSchema>;
+// Define steps for the multi-step form
+const steps = [
+  { id: 'profile', title: 'Your Information' },
+  { id: 'symptoms', title: 'Symptoms' },
+  { id: 'medical-image', title: 'Medical Image (Optional)' },
+  { id: 'medical-history', title: 'Medical History (Optional)' },
+  { id: 'review', title: 'Review & Submit' },
+];
 
 export function SymptomForm() {
+  const [currentStep, setCurrentStep] = useState(0);
   const [isLoading, setIsLoading] = useState(false);
   const [results, setResults] = useState<AnalyzeSymptomsOutput | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const { toast } = useToast();
+  const [progress, setProgress] = useState(0);
 
-  const form = useForm<FormData>({
+  const methods = useForm<FormData>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       name: '',
@@ -92,83 +99,60 @@ export function SymptomForm() {
         currentMedications: '',
       },
       medicalImage: undefined,
+      imageDescription: '',
     },
-     mode: "onChange", // Validate on change to show errors earlier
+    mode: "onChange",
   });
 
-   const handleImageChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      // Validate file type and size client-side before setting preview
-      if (file.size > MAX_FILE_SIZE) {
-          form.setError("medicalImage", { type: "manual", message: `Max image size is ${MAX_FILE_SIZE / 1024 / 1024}MB.` });
-          setImagePreview(null);
-          form.setValue("medicalImage", undefined, { shouldValidate: true }); // Clear invalid value
-          event.target.value = ''; // Reset file input
-          return;
-      }
-      if (!ACCEPTED_IMAGE_TYPES.includes(file.type)) {
-          form.setError("medicalImage", { type: "manual", message: "Invalid file type. Please upload an image (JPEG, PNG, WEBP) or DICOM file." });
-          setImagePreview(null);
-          form.setValue("medicalImage", undefined, { shouldValidate: true }); // Clear invalid value
-           event.target.value = ''; // Reset file input
-          return;
-      }
-
-      // Clear previous errors if validation passes now
-      form.clearErrors("medicalImage");
-
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setImagePreview(reader.result as string);
-        // RHF stores FileList, not the data URI directly
-        form.setValue("medicalImage", event.target.files, { shouldValidate: true });
-      };
-      reader.onerror = () => {
-        console.error("Error reading file");
-         toast({
-          variant: "destructive",
-          title: "File Read Error",
-          description: "Could not read the selected image file.",
-        });
-        setImagePreview(null);
-        form.setValue("medicalImage", undefined, { shouldValidate: true });
-         event.target.value = ''; // Reset file input
-      };
-      reader.readAsDataURL(file);
-    } else {
-      setImagePreview(null);
-      form.setValue("medicalImage", undefined, { shouldValidate: true });
-    }
-  }, [form, toast]);
-
-  const removeImage = useCallback(() => {
-    setImagePreview(null);
-    form.setValue("medicalImage", undefined, { shouldValidate: true, shouldDirty: true });
-    // Reset the actual file input element
-    const fileInput = document.getElementById('medicalImage-input') as HTMLInputElement;
-    if (fileInput) {
-        fileInput.value = '';
-    }
-    form.clearErrors("medicalImage");
-  }, [form]);
-
-
-  const { fields, append, remove } = useFieldArray({
-    control: form.control,
-    name: 'symptoms',
-  });
+  // Update progress bar when step changes
+  useEffect(() => {
+    setProgress(((currentStep + 1) / steps.length) * 100);
+  }, [currentStep]);
 
   // Function to convert File to Data URI
   const fileToDataUri = (file: File): Promise<string> => {
-      return new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result as string);
-          reader.onerror = reject;
-          reader.readAsDataURL(file);
-      });
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result as string);
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
   };
 
+  const goToNextStep = async () => {
+    const stepId = steps[currentStep].id;
+    
+    if (stepId === 'profile') {
+      // Validate only the profile fields
+      const profileValid = await methods.trigger(['name', 'age', 'gender', 'weight', 'weightUnit', 'height', 'heightUnit']);
+      if (!profileValid) return;
+    } else if (stepId === 'symptoms') {
+      // Validate only the symptoms fields
+      const symptomsValid = await methods.trigger('symptoms');
+      if (!symptomsValid) return;
+    } else if (stepId === 'medical-image') {
+      // No validation needed for optional image, just check if there are any errors
+      const imageErrors = methods.formState.errors.medicalImage;
+      if (imageErrors) return;
+    } else if (stepId === 'medical-history') {
+      // No validation needed for optional medical history
+      // Just proceed
+    }
+
+    setCurrentStep(prev => Math.min(prev + 1, steps.length - 1));
+  };
+
+  const goToPreviousStep = () => {
+    setCurrentStep(prev => Math.max(prev - 1, 0));
+  };
+
+  const skipStep = () => {
+    // Only allow skipping optional steps
+    const stepId = steps[currentStep].id;
+    if (stepId === 'medical-image' || stepId === 'medical-history') {
+      setCurrentStep(prev => prev + 1);
+    }
+  };
 
   const onSubmit = async (data: FormData) => {
     setIsLoading(true);
@@ -177,21 +161,20 @@ export function SymptomForm() {
 
     let imageDataUri: string | undefined = undefined;
     if (data.medicalImage && data.medicalImage.length > 0) {
-        try {
-            imageDataUri = await fileToDataUri(data.medicalImage[0]);
-        } catch (err) {
-            console.error("Error converting image to Data URI:", err);
-            setError("Failed to process the uploaded image. Please try again.");
-            setIsLoading(false);
-            return;
-        }
+      try {
+        imageDataUri = await fileToDataUri(data.medicalImage[0]);
+      } catch (err) {
+        console.error("Error converting image to Data URI:", err);
+        setError("Failed to process the uploaded image. Please try again.");
+        setIsLoading(false);
+        return;
+      }
     }
-
 
     // Prepare data for the AI flow
     const formattedMedicalHistory: MedicalHistory = {
-        pastConditions: data.medicalHistory.pastConditions?.split(',').map(s => s.trim()).filter(s => s) ?? [],
-        currentMedications: data.medicalHistory.currentMedications?.split(',').map(s => s.trim()).filter(s => s) ?? [],
+      pastConditions: data.medicalHistory.pastConditions?.split(',').map(s => s.trim()).filter(s => s) ?? [],
+      currentMedications: data.medicalHistory.currentMedications?.split(',').map(s => s.trim()).filter(s => s) ?? [],
     };
 
     const input: AnalyzeSymptomsInput = {
@@ -204,7 +187,7 @@ export function SymptomForm() {
       gender: data.gender,
       symptoms: data.symptoms,
       medicalHistory: formattedMedicalHistory,
-      imageDataUri: imageDataUri, // Add the image data URI
+      imageDataUri: imageDataUri,
     };
 
     try {
@@ -213,15 +196,105 @@ export function SymptomForm() {
     } catch (err) {
       console.error('Error analyzing symptoms:', err);
       setError('An error occurred while analyzing symptoms. The AI model might have limitations with image analysis or the input provided. Please ensure the image is clear and relevant, or try removing it. If the problem persists, contact support.');
-       toast({
-          variant: "destructive",
-          title: "Analysis Error",
-          description: "Failed to get analysis from the AI. Check console for details.",
+      toast({
+        variant: "destructive",
+        title: "Analysis Error",
+        description: "Failed to get analysis from the AI. Check console for details.",
       });
     } finally {
       setIsLoading(false);
     }
   };
+
+  // Render the current step content based on the step index
+  const renderStepContent = () => {
+    const stepId = steps[currentStep].id;
+
+    switch (stepId) {
+      case 'profile':
+        return <ProfileInfoStep />;
+      case 'symptoms':
+        return <SymptomsStep />;
+      case 'medical-image':
+        return <MedicalImageStep imagePreview={imagePreview} setImagePreview={setImagePreview} />;
+      case 'medical-history':
+        return <MedicalHistoryStep />;
+      case 'review':
+        return (
+          <div className="space-y-6">
+            <h3 className="text-lg font-medium">Review Your Information</h3>
+            <div className="space-y-4">
+              <div className="p-4 border rounded-md">
+                <h4 className="font-medium mb-2">Personal Information</h4>
+                <p>Name: {methods.getValues('name')}</p>
+                <p>Age: {methods.getValues('age')}</p>
+                <p>Gender: {methods.getValues('gender')}</p>
+                {methods.getValues('weight') && (
+                  <p>Weight: {methods.getValues('weight')} {methods.getValues('weightUnit')}</p>
+                )}
+                {methods.getValues('height') && (
+                  <p>Height: {methods.getValues('height')} {methods.getValues('heightUnit')}</p>
+                )}
+              </div>
+              
+              <div className="p-4 border rounded-md">
+                <h4 className="font-medium mb-2">Symptoms</h4>
+                <ul className="list-disc pl-5">
+                  {methods.getValues('symptoms').map((symptom, index) => (
+                    <li key={index}>
+                      {symptom.name} - {symptom.severity}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+              
+              {imagePreview && (
+                <div className="p-4 border rounded-md">
+                  <h4 className="font-medium mb-2">Medical Image</h4>
+                  <p>Image uploaded</p>
+                </div>
+              )}
+              
+              {(methods.getValues('medicalHistory.pastConditions') || methods.getValues('medicalHistory.currentMedications')) && (
+                <div className="p-4 border rounded-md">
+                  <h4 className="font-medium mb-2">Medical History</h4>
+                  {methods.getValues('medicalHistory.pastConditions') && (
+                    <div>
+                      <p className="font-medium text-sm">Past Conditions:</p>
+                      <p>{methods.getValues('medicalHistory.pastConditions')}</p>
+                    </div>
+                  )}
+                  {methods.getValues('medicalHistory.currentMedications') && (
+                    <div className="mt-2">
+                      <p className="font-medium text-sm">Current Medications:</p>
+                      <p>{methods.getValues('medicalHistory.currentMedications')}</p>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      default:
+        return null;
+    }
+  };
+
+  if (results) {
+    return (
+      <div className="w-full max-w-2xl mx-auto space-y-8">
+        <Button variant="outline" onClick={() => {
+          setResults(null);
+          methods.reset();
+          setCurrentStep(0);
+          setImagePreview(null);
+        }}>
+          Start New Assessment
+        </Button>
+        <DiagnosisResults results={results} />
+      </div>
+    );
+  }
 
   return (
     <div className="w-full max-w-2xl mx-auto space-y-8">
@@ -229,334 +302,73 @@ export function SymptomForm() {
         <CardHeader className="bg-secondary">
           <CardTitle className="text-2xl font-semibold text-secondary-foreground">Symptom Checker</CardTitle>
           <CardDescription className="text-secondary-foreground/80">
-            Enter your details, symptoms, medical history, and optionally upload a medical image (MRI, X-ray). Our AI will provide potential conditions based on your input.
+            Step {currentStep + 1} of {steps.length}: {steps[currentStep].title}
           </CardDescription>
+          <Progress value={progress} className="w-full mt-2" />
         </CardHeader>
-        <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)}>
+        
+        <FormProvider {...methods}>
+          <form onSubmit={methods.handleSubmit(onSubmit)}>
             <CardContent className="space-y-6 p-6">
-              {/* Profile Section */}
-              <div className="space-y-4">
-                 <Label className="text-lg font-medium">Your Information</Label>
-                  <FormField
-                    control={form.control}
-                    name="name"
-                    render={({ field }) => (
-                    <FormItem>
-                        <FormLabel>Name</FormLabel>
-                        <FormControl>
-                        <Input placeholder="Enter your name" {...field} />
-                        </FormControl>
-                        <FormMessage />
-                    </FormItem>
-                    )}
-                 />
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                    <FormField
-                        control={form.control}
-                        name="age"
-                        render={({ field }) => (
-                        <FormItem>
-                            <FormLabel>Age</FormLabel>
-                            <FormControl>
-                            <Input type="number" placeholder="Enter your age" {...field} onChange={event => field.onChange(event.target.value === '' ? undefined : +event.target.value)} />
-                            </FormControl>
-                            <FormMessage />
-                        </FormItem>
-                        )}
-                    />
-                     <FormField
-                        control={form.control}
-                        name="gender"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Gender</FormLabel>
-                             <Select onValueChange={field.onChange} defaultValue={field.value}>
-                                <FormControl>
-                                  <SelectTrigger>
-                                    <SelectValue placeholder="Select gender" />
-                                  </SelectTrigger>
-                                </FormControl>
-                                <SelectContent>
-                                  {genderOptions.map((option) => (
-                                    <SelectItem key={option} value={option}>
-                                      {option}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                     <FormField
-                        control={form.control}
-                        name="weight"
-                        render={({ field }) => (
-                        <FormItem>
-                            <FormLabel>Weight (Optional)</FormLabel>
-                            <FormControl>
-                             <Input type="number" step="0.1" placeholder="Enter weight" {...field} onChange={event => field.onChange(event.target.value === '' ? undefined : +event.target.value)} />
-                            </FormControl>
-                            <FormMessage />
-                        </FormItem>
-                        )}
-                    />
-                     <FormField
-                        control={form.control}
-                        name="weightUnit"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Weight Unit</FormLabel>
-                             <Select onValueChange={field.onChange} defaultValue={field.value} disabled={!form.watch('weight')}>
-                                <FormControl>
-                                  <SelectTrigger>
-                                    <SelectValue placeholder="Select unit" />
-                                  </SelectTrigger>
-                                </FormControl>
-                                <SelectContent>
-                                  {weightUnits.map((unit) => (
-                                    <SelectItem key={unit} value={unit}>
-                                      {unit}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                 </div>
-                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                     <FormField
-                        control={form.control}
-                        name="height"
-                        render={({ field }) => (
-                        <FormItem>
-                            <FormLabel>Height (Optional)</FormLabel>
-                            <FormControl>
-                            <Input type="number" step="0.1" placeholder="Enter height" {...field} onChange={event => field.onChange(event.target.value === '' ? undefined : +event.target.value)} />
-                            </FormControl>
-                            <FormMessage />
-                        </FormItem>
-                        )}
-                    />
-                     <FormField
-                        control={form.control}
-                        name="heightUnit"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Height Unit</FormLabel>
-                             <Select onValueChange={field.onChange} defaultValue={field.value} disabled={!form.watch('height')}>
-                                <FormControl>
-                                  <SelectTrigger>
-                                    <SelectValue placeholder="Select unit" />
-                                  </SelectTrigger>
-                                </FormControl>
-                                <SelectContent>
-                                  {heightUnits.map((unit) => (
-                                    <SelectItem key={unit} value={unit}>
-                                      {unit}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                </div>
-              </div>
-
-
-              {/* Symptoms Section */}
-              <div className="space-y-4 pt-4 border-t">
-                <Label className="text-lg font-medium">Symptoms</Label>
-                {fields.map((field, index) => (
-                  <div key={field.id} className="flex items-start space-x-3 p-4 border rounded-md bg-card">
-                    <div className="flex-grow grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <FormField
-                        control={form.control}
-                        name={`symptoms.${index}.name`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Symptom</FormLabel>
-                            <FormControl>
-                              <Input placeholder="e.g., Headache, Fever" {...field} />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name={`symptoms.${index}.severity`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Severity</FormLabel>
-                             <Select onValueChange={field.onChange} defaultValue={field.value}>
-                                <FormControl>
-                                  <SelectTrigger>
-                                    <SelectValue placeholder="Select severity" />
-                                  </SelectTrigger>
-                                </FormControl>
-                                <SelectContent>
-                                  {severityLevels.map((level) => (
-                                    <SelectItem key={level} value={level}>
-                                      {level}
-                                    </SelectItem>
-                                  ))}
-                                </SelectContent>
-                              </Select>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                     <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => remove(index)}
-                        className="mt-8 text-destructive hover:bg-destructive/10"
-                        aria-label="Remove symptom"
-                        disabled={fields.length <= 1}
-                      >
-                        <Trash2 className="h-5 w-5" />
-                      </Button>
-                  </div>
-                ))}
-                 <Button
+              {renderStepContent()}
+            </CardContent>
+            
+            <CardFooter className="flex justify-between p-6 border-t">
+              <div>
+                {currentStep > 0 && (
+                  <Button
                     type="button"
                     variant="outline"
-                    size="sm"
-                    onClick={() => append({ name: '', severity: '' })}
-                    className="mt-2"
+                    onClick={goToPreviousStep}
                   >
-                    <PlusCircle className="mr-2 h-4 w-4" /> Add Symptom
-                </Button>
-                 {form.formState.errors.symptoms && !form.formState.errors.symptoms.root?.message && (
-                   <p className="text-sm font-medium text-destructive">
-                     {form.formState.errors.symptoms.message || "Please add at least one symptom."}
-                   </p>
+                    Previous
+                  </Button>
                 )}
-                 {form.formState.errors.symptoms?.root && (
-                   <p className="text-sm font-medium text-destructive">
-                     {form.formState.errors.symptoms.root.message}
-                   </p>
-                 )}
               </div>
-
-             {/* Medical Image Upload Section */}
-              <div className="space-y-4 pt-4 border-t">
-                <Label className="text-lg font-medium">Medical Image (Optional)</Label>
-                <FormDescription>Upload an MRI, X-ray, or other relevant medical image (max 10MB).</FormDescription>
-                 <FormField
-                    control={form.control}
-                    name="medicalImage"
-                    render={({ field: { onChange, value, ...rest } }) => ( // Destructure onChange and value manually
-                      <FormItem>
-                        <FormControl>
-                          <div className="flex items-center gap-4">
-                            <Input
-                              id="medicalImage-input" // Add an ID for easier reset
-                              type="file"
-                              accept={ACCEPTED_IMAGE_TYPES.join(',')}
-                              onChange={handleImageChange} // Use the custom handler
-                              className="hidden" // Hide default input
-                              {...rest} // Pass rest of props like name, ref etc.
-                            />
-                            <Button type="button" variant="outline" onClick={() => document.getElementById('medicalImage-input')?.click()}>
-                               <ImageUp className="mr-2 h-4 w-4" /> Upload Image
-                            </Button>
-                             {imagePreview && (
-                                <div className="relative group">
-                                    <Image
-                                        src={imagePreview}
-                                        alt="Medical image preview"
-                                        width={80}
-                                        height={80}
-                                        className="rounded border object-cover aspect-square"
-                                    />
-                                    <Button
-                                        type="button"
-                                        variant="destructive"
-                                        size="icon"
-                                        className="absolute -top-2 -right-2 h-6 w-6 rounded-full opacity-0 group-hover:opacity-100 transition-opacity"
-                                        onClick={removeImage}
-                                        aria-label="Remove image"
-                                    >
-                                        <X className="h-4 w-4" />
-                                    </Button>
-                                </div>
-                            )}
-                          </div>
-
-                        </FormControl>
-                        <FormMessage />
-                      </FormItem>
+              
+              <div className="flex gap-2">
+                {(steps[currentStep].id === 'medical-image' || steps[currentStep].id === 'medical-history') && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={skipStep}
+                  >
+                    Skip
+                  </Button>
+                )}
+                
+                {currentStep < steps.length - 1 ? (
+                  <Button
+                    type="button"
+                    onClick={goToNextStep}
+                  >
+                    Next
+                  </Button>
+                ) : (
+                  <Button
+                    type="submit"
+                    disabled={isLoading || !methods.formState.isValid}
+                  >
+                    {isLoading ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Analyzing...
+                      </>
+                    ) : (
+                      'Analyze Symptoms'
                     )}
-                  />
-
+                  </Button>
+                )}
               </div>
-
-
-              {/* Medical History Section */}
-              <div className="space-y-4 pt-4 border-t">
-                <Label className="text-lg font-medium">Medical History (Optional)</Label>
-                 <FormField
-                    control={form.control}
-                    name="medicalHistory.pastConditions"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Past Conditions</FormLabel>
-                        <FormControl>
-                          <Textarea placeholder="e.g., Asthma, Diabetes (comma-separated)" {...field} />
-                        </FormControl>
-                         <FormDescription>Enter any relevant past medical conditions, separated by commas.</FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-                 <FormField
-                    control={form.control}
-                    name="medicalHistory.currentMedications"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormLabel>Current Medications</FormLabel>
-                        <FormControl>
-                          <Textarea placeholder="e.g., Ibuprofen, Metformin (comma-separated)" {...field} />
-                        </FormControl>
-                         <FormDescription>List any medications you are currently taking, separated by commas.</FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )}
-                  />
-              </div>
-            </CardContent>
-            <CardFooter className="flex flex-col items-center p-6 border-t">
-               <Button type="submit" disabled={isLoading || !form.formState.isValid} className="w-full max-w-xs">
-                 {isLoading ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Analyzing...
-                    </>
-                  ) : (
-                    'Analyze Symptoms'
-                  )}
-              </Button>
-               {!form.formState.isValid && form.formState.isSubmitted && (
-                <p className="mt-4 text-sm text-destructive">Please fix the errors in the form before submitting.</p>
-              )}
-              {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
             </CardFooter>
+            
+            {error && (
+              <div className="px-6 pb-6">
+                <p className="text-sm text-destructive">{error}</p>
+              </div>
+            )}
           </form>
-        </Form>
+        </FormProvider>
       </Card>
-
-      {/* Results Section */}
-      {results && <DiagnosisResults results={results} />}
     </div>
   );
 }
